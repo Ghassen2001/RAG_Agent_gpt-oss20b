@@ -1,0 +1,16 @@
+# requirements.txt
+
+streamlit
+openai
+pandas
+langdetect
+# scikit-learn is no longer strictly needed by the core RAG logic if FAISS handles similarity
+# but might be useful for other tasks if you expand. Let's keep it for now.
+scikit-learn
+numpy
+PyPDF2
+beautifulsoup4
+Pillow
+easyocr
+requests
+faiss-cpu # or faiss-gpu if you have a compatible GPU and CUDA setup
