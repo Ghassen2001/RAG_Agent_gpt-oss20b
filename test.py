@@ -5,14 +5,24 @@ import streamlit as st
 import uuid
 import re
 import os
-from openai import OpenAI, APIError, AuthenticationError, RateLimitError
+# OpenAI integration removed — GROQ-only provider now
 import pandas as pd
 from datetime import datetime
 from langdetect import detect, LangDetectException # As per document section 3.3
 import numpy as np
+import time
 
 # --- New Imports for File Processing ---
 from io import BytesIO
+
+# --- GROQ SDK (optional) ---
+groq_sdk_available = False
+try:
+    from groq import Groq
+    groq_sdk_available = True
+except Exception:
+    Groq = None
+    groq_sdk_available = False
 
 # --- PyPDF2 for PDF processing (Document 2.1.1, 3.3) ---
 py_pdf_available = False
@@ -79,6 +89,17 @@ try:
 except ImportError:
     faiss = None
 
+# --- sentence-transformers (local open-source embeddings) ---
+st_transformer_available = False
+SentenceTransformer = None
+sentence_model = None
+try:
+    from sentence_transformers import SentenceTransformer
+    st_transformer_available = True
+except Exception:
+    SentenceTransformer = None
+    st_transformer_available = False
+
 # Call set_page_config() as the FIRST Streamlit command
 st.set_page_config(layout="wide")
 
@@ -87,6 +108,9 @@ EMBEDDING_DIMS = {
     "text-embedding-3-small": 1536,
     "text-embedding-ada-002": 1536,
     "text-embedding-3-large": 3072,
+    "sentence-transformers/all-MiniLM-L6-v2": 384,
+    # No specific Groq embedding models listed here as they often proxy OpenAI's or have compatible interfaces
+    # If Groq introduces distinct embedding models, add them here.
 }
 
 # --- Initialize session state ---
@@ -94,12 +118,27 @@ if 'documents' not in st.session_state:
     st.session_state.documents = {}
 if 'doc_counter' not in st.session_state:
     st.session_state.doc_counter = 0
-if 'openai_api_key' not in st.session_state:
-    st.session_state.openai_api_key = None
+# OpenAI API key removed from session state (GROQ-only)
+if 'groq_api_key' not in st.session_state: # Ensure Groq API key is in session state
+    st.session_state.groq_api_key = None
+if 'groq_base_url' not in st.session_state:
+    st.session_state.groq_base_url = 'https://api.groq.ai/v1'
+if 'groq_model' not in st.session_state:
+    # Default Groq model — user can change in the sidebar when GROQ provider is selected
+    st.session_state.groq_model = 'openai/gpt-oss-20b'
+
 if 'embedding_model' not in st.session_state:
-    st.session_state.embedding_model = "text-embedding-3-small" # Default model as per doc 2.1.1
+    # Default to the local sentence-transformers backend
+    st.session_state.embedding_model = "sentence-transformers"
+
+if 'local_embedding_model' not in st.session_state:
+    # Default local sentence-transformers model (use full HF repo id)
+    st.session_state.local_embedding_model = 'sentence-transformers/all-MiniLM-L6-v2'
 if 'rag_enabled' not in st.session_state:
     st.session_state.rag_enabled = True
+if 'provider' not in st.session_state: # Default provider now GROQ-only
+    st.session_state.provider = 'groq'
+
 
 if 'faiss_index' not in st.session_state:
     st.session_state.faiss_index = None
@@ -148,48 +187,129 @@ def simple_chunker(text, chunk_size=200, overlap=50):
     return [c for c in chunks if c.strip()]
 
 # (embedding_generator.py equivalent from doc 3.1)
-def get_embedding(text, api_key, model="text-embedding-3-small"):
-    if not api_key:
-        st.error("OpenAI API Key not provided for embedding generation.")
+def get_embedding(text, api_key=None, model=None):
+    """
+    Generate an embedding for `text` using either a local sentence-transformers model
+    or the GROQ embeddings endpoint depending on configuration.
+    """
+    text = text.replace("\n", " ")
+
+    # Local sentence-transformers (open-source) path
+    if st.session_state.get('embedding_model') == 'sentence-transformers':
+        if not st_transformer_available:
+            st.error("Le package 'sentence-transformers' n'est pas installé. Installez-le via requirements.txt ou pip.")
+            return None
+        global sentence_model
+        try:
+            if sentence_model is None:
+                model_name = st.session_state.get('local_embedding_model', 'all-MiniLM-L6-v2')
+                sentence_model = SentenceTransformer(model_name)
+            emb = sentence_model.encode(text)
+            # Convert numpy array to list for FAISS compatibility elsewhere
+            try:
+                return emb.tolist()
+            except Exception:
+                return list(emb)
+        except Exception as e:
+            st.error(f"Erreur lors de la génération d'embeddings locaux: {e}")
+            return None
+
+    # GROQ cloud embeddings path
+    groq_key = st.session_state.get('groq_api_key')
+    groq_base = st.session_state.get('groq_base_url', 'https://api.groq.ai/v1')
+    if not groq_key:
+        st.error('GROQ API key not provided for embeddings. Configure it in the sidebar.')
         return None
-    try:
-        client = OpenAI(api_key=api_key)
-        text = text.replace("\n", " ")
-        response = client.embeddings.create(input=[text], model=model)
-        return response.data[0].embedding
-    except AuthenticationError:
-        st.error("OpenAI API Key is invalid. Could not generate embeddings.")
+    if not requests_available:
+        st.error("Le module 'requests' n'est pas disponible. Impossible d'appeler l'API GROQ pour les embeddings.")
         return None
-    except RateLimitError:
-        st.error("Rate limit exceeded for OpenAI Embeddings API.")
-        return None
-    except APIError as e:
-        st.error(f"OpenAI API error during embedding: {e}")
-        return None
-    except Exception as e:
-        st.error(f"An unexpected error occurred during embedding: {str(e)}")
-        return None
+
+    url = groq_base.rstrip('/') + '/embeddings'
+    headers = {'Authorization': f'Bearer {groq_key}', 'Content-Type': 'application/json'}
+    payload = {'model': model or st.session_state.get('groq_model'), 'input': text}
+
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            j = resp.json()
+            if 'data' in j and isinstance(j['data'], list) and len(j['data'])>0:
+                emb = j['data'][0].get('embedding') or j['data'][0].get('vector')
+                if emb:
+                    return emb
+            if 'embedding' in j:
+                return j['embedding']
+            st.error('GROQ embeddings response did not contain an embedding vector.')
+            return None
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            err_text = str(e)
+            if 'NameResolutionError' in err_text or 'Failed to resolve' in err_text or 'getaddrinfo failed' in err_text:
+                st.error(f"Network/DNS error calling GROQ embeddings endpoint: {e}.\nPlease check your network/DNS settings, proxy, or the GROQ Base URL in the sidebar.")
+                return None
+            if attempt < 3:
+                time.sleep(attempt)
+                continue
+            else:
+                break
+        except Exception as e:
+            st.error(f'Unexpected error during GROQ embedding call: {e}')
+            return None
+
+    # If we exhausted retries, optionally attempt fallback to local sentence-transformers
+    if last_exc is not None:
+        st.warning(f"GROQ embeddings network error after retries: {last_exc}")
+        groq_autofallback = st.session_state.get('groq_autofallback', False)
+        if groq_autofallback and st_transformer_available:
+            st.info("GROQ unreachable. Attempting fallback to local sentence-transformers for embeddings...")
+            return get_embedding(text, api_key=None, model=None)
+        else:
+            if not groq_autofallback:
+                st.error('GROQ embeddings unavailable and automatic fallback is disabled. Check GROQ configuration in the sidebar.')
+            else:
+                st.error("GROQ embeddings unavailable and sentence-transformers is not installed for local fallback. Install it via requirements.txt.")
+    else:
+        st.error('Unknown error calling GROQ embeddings endpoint.')
+    return None
 
 # (chunk_retriever.py equivalent from doc 3.1)
 def faiss_similarity_search(query_embedding, faiss_index, chunk_store_list, top_k=3, similarity_threshold=0.7):
     if query_embedding is None or faiss_index is None or not chunk_store_list or faiss_index.ntotal == 0:
         return []
-    
-    query_embedding_np = np.array([query_embedding], dtype='float32')
+
+    # Ensure query_embedding is a 1D list/array
+    if not isinstance(query_embedding, (list, np.ndarray)):
+        st.error("Query embedding is not a valid list or numpy array.")
+        return []
+    if isinstance(query_embedding, np.ndarray) and query_embedding.ndim > 1:
+        query_embedding = query_embedding.flatten() # Flatten if it's 2D with one row
+
+    # Ensure query embedding matches FAISS index dimension
+    if len(query_embedding) != faiss_index.d:
+        st.error(f"Query embedding dimension ({len(query_embedding)}) does not match FAISS index dimension ({faiss_index.d}).")
+        return []
+
+    query_embedding_np = np.array([query_embedding], dtype='float32') # FAISS expects 2D array [num_queries, dim]
+
     scores, indices = faiss_index.search(query_embedding_np, top_k)
-    
+
     results = []
     if indices.size > 0:
-        for i in range(indices.shape[1]): 
+        for i in range(indices.shape[1]):
             faiss_id = indices[0, i]
             score = float(scores[0, i])
-            
+
             if faiss_id == -1: continue
 
+            # FAISS returns scores in increasing order for L2, so closer means smaller score.
+            # For Inner Product (IP), higher score is more similar.
+            # Assuming IP, so higher score means more relevant. If using L2, similarity_threshold logic needs to be inverted.
+            # For cosine similarity with normalized vectors, IP == cosine similarity, so higher is better.
             if score >= similarity_threshold:
                 if 0 <= faiss_id < len(chunk_store_list):
                     chunk_data = chunk_store_list[faiss_id].copy() # Return a copy
-                    chunk_data['score'] = score 
+                    chunk_data['score'] = score
                     results.append(chunk_data)
                 else:
                     st.warning(f"FAISS returned ID {faiss_id} which is out of bounds for chunk_store (size {len(chunk_store_list)}). Skipping.")
@@ -200,7 +320,7 @@ def faiss_similarity_search(query_embedding, faiss_index, chunk_store_list, top_
 def conli_guard_validator(response_text, context_chunks):
     # Validates coherence phrase by phrase against verified knowledge (context)
     # st.info("[Guardrail - conli-guard]: Checking response-context coherence...")
-    return True, "conli-guard: OK" 
+    return True, "conli-guard: OK"
 
 def cove_guard_validator(response_text, context_chunks, query):
     # Verifies if the response can be logically justified by a verification chain from context
@@ -227,9 +347,10 @@ def unusual_prompt_guard_validator(user_query):
     return True, "unusual-prompt-guard: OK"
 
 # (Prompt Constructor + LLM call - implicit from doc 3.1, pipeline step 7)
-def real_llm_generation_with_openai(query, context_chunks, api_key, model="gpt-4o"): # Model updated as per doc
-    if not api_key:
-        return "OpenAI API Key not provided. Please enter it in the sidebar."
+def real_llm_generation(query, context_chunks, api_key, model="gpt-4o"):
+    provider = st.session_state.get('provider', 'groq')
+    if provider == 'groq' and not st.session_state.get('groq_api_key'):
+        return "GROQ API Key not provided. Please enter it in the sidebar."
 
     # --- Conceptual Guardrail Integration Point (Input) ---
     if st.session_state.guardrails_enabled.get("unusual_prompt", False):
@@ -237,15 +358,14 @@ def real_llm_generation_with_openai(query, context_chunks, api_key, model="gpt-4
         st.sidebar.caption(f"Unusual Prompt Guard: {prompt_guard_msg}")
         if not is_prompt_ok:
             return f"Query blocked by unusual-prompt-guard: {prompt_guard_msg}"
-    
+
     if st.session_state.guardrails_enabled.get("detectpii", False):
         is_pii_ok_query, pii_guard_msg_query = detectpii_guard_validator(query)
         st.sidebar.caption(f"PII Guard (Query): {pii_guard_msg_query}")
         # Could decide to block or warn based on policy
 
     try:
-        client = OpenAI(api_key=api_key)
-        # Prompt Construction (doc 3.1 prompt_constructor.py)
+        # Prompt Construction
         if not context_chunks or not st.session_state.rag_enabled:
             prompt_messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
@@ -257,14 +377,108 @@ def real_llm_generation_with_openai(query, context_chunks, api_key, model="gpt-4
                 {"role": "system", "content": "You are a helpful assistant. Answer the user's question based ONLY on the provided context. If the answer is not in the context, say you cannot answer based on the provided information. Cite the source document ID or name if possible from the context."},
                 {"role": "user", "content": f"Here is the context from one or more documents:\n\n---\n{context_text}\n---\n\nBased on this context, answer the question: {query}"}
             ]
-        
-        response = client.chat.completions.create(
-            model=model, # Using model parameter, can be gpt-4, gpt-4o as per doc
-            messages=prompt_messages,
-            temperature=0.2, # Low temperature for factual RAG
-            max_tokens=350
-        )
-        llm_response_content = response.choices[0].message.content.strip()
+
+
+        if provider == 'groq':
+            groq_key = st.session_state.get('groq_api_key')
+            groq_base = st.session_state.get('groq_base_url', 'https://api.groq.ai/v1')
+            # Prefer Groq SDK if available (supports streaming and richer features)
+            if groq_sdk_available:
+                try:
+                    # Initialize client (pass api_key if available)
+                    if groq_key:
+                        client = Groq(api_key=groq_key)
+                    else:
+                        client = Groq()
+
+                    # Use Groq SDK to create a completion. Use max_completion_tokens param name used by Groq SDK.
+                    # Use stream=False here to receive a single response; streaming could be implemented later.
+                    completion = client.chat.completions.create(
+                        model=model,
+                        messages=prompt_messages,
+                        temperature=0.2,
+                        max_completion_tokens=350,
+                        top_p=1,
+                        stream=False
+                    )
+
+                    # Try to extract text content from the SDK response in a few different shapes
+                    llm_response_content = None
+                    try:
+                        # Some SDK responses are dict-like
+                        if isinstance(completion, dict):
+                            if 'choices' in completion and len(completion['choices'])>0:
+                                c = completion['choices'][0]
+                                if isinstance(c.get('message'), dict) and 'content' in c['message']:
+                                    llm_response_content = c['message']['content'].strip()
+                                elif 'text' in c:
+                                    llm_response_content = c['text'].strip()
+                        else:
+                            # Object-like response
+                            choice0 = getattr(completion, 'choices', None)
+                            if choice0 and len(choice0) > 0:
+                                c0 = choice0[0]
+                                # message may be attribute or dict
+                                msg = getattr(c0, 'message', None)
+                                if isinstance(msg, dict) and 'content' in msg:
+                                    llm_response_content = msg['content'].strip()
+                                else:
+                                    # try nested attributes
+                                    content_attr = None
+                                    try:
+                                        content_attr = c0.message.content
+                                    except Exception:
+                                        content_attr = None
+                                    if content_attr:
+                                        llm_response_content = content_attr.strip()
+                    except Exception:
+                        llm_response_content = None
+
+                    if not llm_response_content:
+                        # Fallback: stringify response
+                        try:
+                            llm_response_content = str(completion)
+                        except Exception:
+                            llm_response_content = ""
+
+                except Exception as e_gsdk:
+                    st.error(f"GROQ SDK chat error: {e_gsdk}")
+                    return f"GROQ SDK chat error: {e_gsdk}"
+            else:
+                # Fall back to HTTP requests-based call if SDK not available
+                if not requests_available:
+                    st.error("Le module 'requests' n'est pas disponible. Impossible d'appeler l'API GROQ pour le chat.")
+                    return f"GROQ request error: missing requests module"
+
+                url = groq_base.rstrip('/') + '/chat/completions'
+                headers = {'Authorization': f'Bearer {groq_key}', 'Content-Type': 'application/json'}
+                payload = {
+                    'model': model,
+                    'messages': prompt_messages,
+                    'temperature': 0.2,
+                    'max_tokens': 350
+                }
+                try:
+                    resp = requests.post(url, json=payload, headers=headers, timeout=60)
+                    resp.raise_for_status()
+                    j = resp.json()
+                    if 'choices' in j and isinstance(j['choices'], list) and len(j['choices'])>0:
+                        choice = j['choices'][0]
+                        if isinstance(choice.get('message'), dict) and 'content' in choice['message']:
+                            llm_response_content = choice['message']['content'].strip()
+                        elif 'text' in choice: # Fallback for some API structures
+                            llm_response_content = choice['text'].strip()
+                        else:
+                            llm_response_content = str(choice) # Generic fallback
+                    elif 'text' in j: # Another fallback
+                        llm_response_content = j['text']
+                    else:
+                        llm_response_content = j.get('content') or str(j) # Final attempt
+                except requests.exceptions.RequestException as e_req:
+                    st.error(f"Network error calling GROQ chat endpoint: {e_req}")
+                    return f"GROQ request error: {e_req}"
+        else:
+            return f"Unsupported provider for LLM generation: {provider}"
 
         # --- Conceptual Guardrail Integration Point (Output) ---
         # (response_postprocessor.py from doc 3.1 could live here)
@@ -278,7 +492,7 @@ def real_llm_generation_with_openai(query, context_chunks, api_key, model="gpt-4
                 is_cove_ok, cove_msg = cove_guard_validator(llm_response_content, context_chunks, query)
                 st.sidebar.caption(f"CoVe Guard: {cove_msg}")
                 # if not is_cove_ok: llm_response_content += f"\n[Warning: {cove_msg}]"
-        
+
         # ContextCheck guard could look at chat history (not implemented here)
         # if st.session_state.guardrails_enabled.get("contextcheck", False):
         # is_context_ok, context_msg = contextcheck_guard_validator(llm_response_content, st.session_state.get('chat_history', []))
@@ -290,15 +504,9 @@ def real_llm_generation_with_openai(query, context_chunks, api_key, model="gpt-4
             # if not is_pii_ok_response: llm_response_content = "[PII Redacted by Guardrail]"
 
         return llm_response_content
-    except AuthenticationError:
-        st.error("OpenAI API Key is invalid or not authorized. Please check your key and ensure it has credit/is active.")
-        return "AuthenticationError: Invalid API Key or insufficient credits."
-    except RateLimitError:
-        st.error("You have exceeded your OpenAI API quota or rate limit. Please check your usage or try again later.")
-        return "RateLimitError: API quota exceeded."
-    except APIError as e:
-        st.error(f"An OpenAI API error occurred: {e}")
-        return f"OpenAI API Error: {e}"
+    except Exception as e:
+        st.error(f"An unexpected error occurred: {str(e)}")
+        return f"An unexpected error occurred: {str(e)}"
     except Exception as e:
         st.error(f"An unexpected error occurred: {str(e)}")
         return f"An unexpected error occurred: {str(e)}"
@@ -379,17 +587,17 @@ def fetch_and_extract_text_from_url(url):
         }
         response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
         response.raise_for_status() # Raise HTTPError for bad responses (4XX or 5XX)
-        
+
         doc_name = url # Default doc name to URL
         soup = BeautifulSoup(response.text, "html.parser")
 
         if soup.title and soup.title.string: # Try to get a better doc name from title
             doc_name = soup.title.string.strip()
-        
+
         # Remove common non-content tags
         for non_content_tag in soup(["script", "style", "header", "footer", "nav", "aside", "form", "meta", "link"]):
             non_content_tag.decompose()
-        
+
         text = soup.get_text(separator=" ", strip=True) # Get text, stripping tags and extra whitespace
         return text, doc_name
     except requests.exceptions.Timeout:
@@ -403,8 +611,8 @@ def fetch_and_extract_text_from_url(url):
         return None, None
 
 # --- Streamlit App UI ---
-st.title("Agent RAG - Étude de Faisabilité et Architecture")
-st.markdown("Basé sur le document du 20 Juin 2025. Ingestion: PDF, DOCX, HTML, Images (EasyOCR), Liens Web. Stockage: FAISS.")
+st.title("Agent RAG")
+st.markdown("Ingestion: PDF, DOCX, HTML, Images (EasyOCR), Liens Web. Stockage: FAISS.")
 
 # Display missing dependencies warnings
 if not py_pdf_available: st.warning("PyPDF2 non installé. Traitement PDF indisponible. `pip install PyPDF2`")
@@ -420,33 +628,46 @@ st.markdown("---")
 
 # --- Sidebar Configuration ---
 st.sidebar.title("Configuration (Conforme Doc 2.1.1)")
-st.sidebar.markdown("**IMPORTANT:** Clé API OpenAI requise.")
-api_key_input = st.sidebar.text_input(
-    "Clé API OpenAI:", type="password", help="Obtenez sur platform.openai.com."
+st.sidebar.markdown("**IMPORTANT:** Clé API GROQ requise pour le fournisseur GROQ. Pour les embeddings locaux, aucun clé externe n'est nécessaire.")
+
+# Provider selection: GROQ (cloud) or local sentence-transformers
+st.sidebar.selectbox(
+    "Fournisseur LLM/Embedding :",
+    ['groq', 'local'],
+    index=0 if st.session_state.provider == 'groq' else 1,
+    key='provider_select' # This key updates st.session_state.provider on change
 )
-if api_key_input:
-    st.session_state.openai_api_key = api_key_input
-elif os.getenv("OPENAI_API_KEY") and not st.session_state.openai_api_key: # Check env var if not already set
-     st.session_state.openai_api_key = os.getenv("OPENAI_API_KEY")
+st.session_state.provider = st.session_state.get('provider_select')
+
+if st.session_state.provider == 'groq':
+    st.sidebar.markdown("**GROQ Configuration**")
+    groq_api_key_input = st.sidebar.text_input("GROQ API Key:", type="password", help="Entrez votre clé GROQ.")
+    if groq_api_key_input:
+        st.session_state.groq_api_key = groq_api_key_input
+    elif os.getenv('GROQ_API_KEY') and not st.session_state.get('groq_api_key'):
+        st.session_state.groq_api_key = os.getenv('GROQ_API_KEY')
+
+    st.session_state.groq_base_url = st.sidebar.text_input('GROQ Base URL:', value=st.session_state.groq_base_url)
+    # Allow user to pick a Groq model (example: gpt-oss-20b or llama3-8b-8192)
+    st.session_state.groq_model = st.sidebar.text_input('GROQ Model:', value=st.session_state.groq_model, help='Ex: gpt-oss-20b or llama3-8b-8192')
+    # Allow automatic fallback to local embeddings when GROQ is unreachable
+    if 'groq_autofallback' not in st.session_state:
+        st.session_state.groq_autofallback = True
+    st.session_state.groq_autofallback = st.sidebar.checkbox(
+    "Activer la bascule automatique vers les embeddings locaux si GROQ est inaccessible",
+        value=st.session_state.groq_autofallback,
+        help="Si activé et si l'appel aux embeddings GROQ échoue pour des raisons réseau ou DNS, l'application tentera d'utiliser un modèle local sentence-transformers si disponible."
+    )
 
 st.sidebar.selectbox(
-    "Modèle d'Embedding OpenAI (Doc 2.1.1):",
-    list(EMBEDDING_DIMS.keys()),
-    key='embedding_model', 
-    help="Modèle pour vectorisation. 'text-embedding-3-small' est recommandé par le document."
+    "Backend d'Embedding :",
+    ['sentence-transformers', 'groq'],
+    key='embedding_model',
+    help="Choisissez le backend d'embedding: 'sentence-transformers' pour local open-source, 'groq' pour GROQ cloud embeddings."
 )
-st.sidebar.info(f"Modèle d'embedding actif: `{st.session_state.embedding_model}`")
+st.sidebar.info(f"Backend d'embedding actif: `{st.session_state.embedding_model}`")
 
-# --- Conceptual Guardrails Sidebar (Section 3.4) ---
-st.sidebar.subheader("Validateurs Guardrails (Conceptuel - Doc 3.4)")
-st.sidebar.caption("Activation/Désactivation (simulation).")
-st.session_state.guardrails_enabled["conli"] = st.sidebar.checkbox("conli-guard (cohérence LLM/connaissances)", value=st.session_state.guardrails_enabled["conli"])
-st.session_state.guardrails_enabled["cove"] = st.sidebar.checkbox("cove-guard (justification logique)", value=st.session_state.guardrails_enabled["cove"])
-st.session_state.guardrails_enabled["contextcheck"] = st.sidebar.checkbox("contextcheck-guard (contexte conversationnel)", value=st.session_state.guardrails_enabled["contextcheck"])
-st.session_state.guardrails_enabled["detectpii"] = st.sidebar.checkbox("detectpii-guard (détection PII)", value=st.session_state.guardrails_enabled["detectpii"])
-st.session_state.guardrails_enabled["unusual_prompt"] = st.sidebar.checkbox("unusual-prompt-guard (requêtes suspectes)", value=st.session_state.guardrails_enabled["unusual_prompt"])
-st.sidebar.markdown("---")
-# --- End Guardrails Sidebar ---
+
 
 st.header("1. Agent d'Acquisition de Documents (Indexation FAISS)")
 st.markdown("Pipeline: Import -> Extraction -> Découpage -> Vectorisation -> Indexation FAISS (Doc 3.2)")
@@ -509,24 +730,35 @@ with col2_acq:
         chunk_overlap_words = st.slider("Chevauchement des Chunks (en mots):", 0, 100, 20, 5)
 
 if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
-    if not st.session_state.openai_api_key:
-        st.error("Clé API OpenAI manquante. Veuillez la configurer dans la barre latérale.")
+    provider = st.session_state.get('provider', 'groq')
+    if provider == 'groq' and not st.session_state.get('groq_api_key'):
+        st.error("Clé API GROQ manquante. Veuillez la configurer dans la barre latérale.")
+        st.stop() # Stop further execution
+        st.error("Clé API GROQ manquante. Veuillez la configurer dans la barre latérale.")
+        st.stop() # Stop further execution
     elif not faiss_available:
         st.error("FAISS n'est pas disponible. Impossible de traiter et stocker les documents.")
+        st.stop() # Stop further execution
     else:
-        current_embedding_dim = EMBEDDING_DIMS.get(st.session_state.embedding_model)
+        # Determine the current embedding dimension based on selected backend/model
+        if st.session_state.get('embedding_model') == 'sentence-transformers':
+            model_key_for_dim = st.session_state.get('local_embedding_model', 'sentence-transformers/all-MiniLM-L6-v2')
+        else:
+            # For GROQ or other backends, try the embedding_model value first, then fall back to groq_model
+            model_key_for_dim = st.session_state.get('embedding_model') or st.session_state.get('groq_model')
+
+        current_embedding_dim = EMBEDDING_DIMS.get(model_key_for_dim)
         if not current_embedding_dim:
-            st.error(f"Dimension d'embedding inconnue pour le modèle {st.session_state.embedding_model}.")
+            st.error(f"Dimension d'embedding inconnue pour le modèle {model_key_for_dim}.")
             st.stop()
 
         if st.session_state.faiss_index is None or st.session_state.faiss_index_dim != current_embedding_dim:
             if st.session_state.faiss_index is not None and st.session_state.faiss_index_dim != current_embedding_dim:
                 st.warning(f"Le modèle d'embedding a changé (dim: {st.session_state.faiss_index_dim} -> {current_embedding_dim}). L'index FAISS et les chunks existants vont être effacés.")
-            
             st.session_state.faiss_index = faiss.IndexFlatIP(current_embedding_dim) # Cosine similarity for normalized vectors
             st.session_state.faiss_index_dim = current_embedding_dim
-            st.session_state.chunk_store = [] 
-            st.info(f"Index FAISS (re)initialisé pour dimension {current_embedding_dim} (modèle: {st.session_state.embedding_model}).")
+            st.session_state.chunk_store = []
+            st.info(f"Index FAISS (re)initialisé pour dimension {current_embedding_dim} (modèle: {model_key_for_dim}).")
 
         doc_text_to_process = None
         doc_name_for_processing = "Document Inconnu"
@@ -559,7 +791,7 @@ if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
                     doc_text_to_process = None # Ensure it's None if prerequisites fail
                 else:
                     st.warning(f"Type de fichier '{uploaded_file_val.type}' non supporté ou dépendance manquante."); doc_text_to_process = None
-            
+
             if not doc_text_to_process or not doc_text_to_process.strip():
                  if uploaded_file_val: st.error(f"Extraction de texte échouée ou le document '{doc_name_for_processing}' est vide.")
 
@@ -587,7 +819,7 @@ if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
             with st.spinner(f"Traitement de '{doc_name_for_processing}': Pré-traitement, Découpage (Étape 3), Vectorisation et Indexation FAISS (Étape 4)..."):
                 st.session_state.doc_counter += 1
                 doc_id = f"doc_{st.session_state.doc_counter}_{str(uuid.uuid4())[:8]}" # Unique ID for the document
-                
+
                 # Store basic document info (not chunks yet)
                 st.session_state.documents[doc_id] = {
                     'name': doc_name_for_processing, 'original_text_preview': doc_text_to_process[:500] + "...",
@@ -595,7 +827,7 @@ if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
                 }
 
                 cleaned_text = preprocess_text(doc_text_to_process) # query_preprocessor.py equivalent
-                
+
                 detected_lang = "N/A" # Default language
                 try: # Language detection (Doc 3.2, 3.3)
                     if cleaned_text: # Ensure there's text to detect
@@ -617,7 +849,10 @@ if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
                     prog_bar = st.progress(0, text=f"Vectorisation & Indexation FAISS: 0/{total_chunks_to_embed} chunks")
                     for i_chunk, chunk_text in enumerate(new_chunks_text):
                         if chunk_text: # Ensure chunk is not empty
-                            embedding = get_embedding(chunk_text, st.session_state.openai_api_key, model=st.session_state.embedding_model)
+                            # Pass API key corresponding to provider
+                            provider = st.session_state.get('provider', 'groq')
+                            api_key_for_embedding = st.session_state.get('groq_api_key') if provider == 'groq' else None
+                            embedding = get_embedding(chunk_text, api_key_for_embedding, model=st.session_state.get('groq_model'))
                             if embedding:
                                 embedding_np = np.array([embedding], dtype='float32')
                                 try:
@@ -649,7 +884,7 @@ if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
                     st.warning(f"Aucun chunk n'a été généré pour le document '{doc_name_for_processing}'. Vérifiez la méthode de découpage et le contenu.")
                 elif not cleaned_text and doc_text_to_process: # Text became empty after preprocessing
                      st.warning(f"Le document '{doc_name_for_processing}' est devenu vide après le pré-traitement. Aucun chunk généré.")
-        
+
         if processed_successfully and input_source_used: # Reset the input field that was used
             if input_source_used == 'file': st.session_state.file_uploader_key_suffix += 1
             elif input_source_used == 'url': st.session_state.web_url_input_key_suffix += 1
@@ -660,7 +895,7 @@ if st.button("Traiter et Vectoriser dans FAISS (Pipeline étapes 1-4)"):
 
 # --- Display Chunks ---
 st.subheader("Aperçu des Derniers Chunks Indexés (Métadonnées de `chunk_store`)")
-if faiss_available and st.session_state.chunk_store and st.session_state.faiss_index and st.session_state.faiss_index.ntotal > 0:
+if faiss_available and st.session_state.chunk_store and st.session_state.faiss_index is not None and st.session_state.faiss_index.ntotal > 0:
     num_to_display = min(5, len(st.session_state.chunk_store)) # Display last 5 or fewer
     # Prepare data for display, fetching from the end of chunk_store
     display_data = [{
@@ -671,10 +906,10 @@ if faiss_available and st.session_state.chunk_store and st.session_state.faiss_i
         "Aperçu Texte": c['text'][:70] + "..." if len(c['text']) > 70 else c['text'],
         "Indexé FAISS": "Oui" # Assumed if in chunk_store and FAISS is active
     } for c in reversed(st.session_state.chunk_store[-num_to_display:])] # Iterate reversed for latest first
-    
+
     if display_data:
         st.dataframe(pd.DataFrame(display_data), use_container_width=True, hide_index=True)
-    
+
     st.caption(f"Total de chunks dans l'index FAISS: {st.session_state.faiss_index.ntotal}. Métadonnées stockées pour: {len(st.session_state.chunk_store)} chunks.")
     if st.session_state.faiss_index.ntotal != len(st.session_state.chunk_store):
         st.warning("Incohérence détectée: Le nombre de chunks dans FAISS ne correspond pas au nombre de métadonnées stockées. Cela peut arriver si une erreur survient pendant l'indexation.")
@@ -696,22 +931,28 @@ if st.session_state.rag_enabled:
     with col1_exp: top_k_retrieval = st.slider("Nombre de Chunks à récupérer (Top-K):", 1, 10, 3, help="Nombre de chunks les plus similaires à récupérer de FAISS.")
     with col2_exp: similarity_thresh = st.slider("Seuil de Similarité Minimum:", 0.0, 1.0, 0.70, 0.05, help="Similarité minimale pour qu'un chunk soit considéré pertinent.")
 
-if st.button("Obtenir Réponse (OpenAI avec/sans RAG FAISS)"):
-    if not st.session_state.openai_api_key: st.error("Clé API OpenAI manquante! Veuillez la configurer.")
+if st.button(f"Obtenir Réponse ({st.session_state.get('provider','groq').upper()} avec/sans RAG FAISS)"):
+    provider = st.session_state.get('provider', 'groq')
+    if provider == 'groq' and not st.session_state.get('groq_api_key'):
+        st.error("Clé API GROQ manquante! Veuillez la configurer.")
+        st.stop()
     elif not user_query: st.warning("Veuillez entrer une question.")
     elif not faiss_available and st.session_state.rag_enabled:
         st.error("FAISS non disponible. La recherche RAG est impossible. Désactivez le RAG ou installez FAISS.")
+        st.stop()
     else:
         retrieved_chunks_for_llm = []; query_embedding_success = True # Assume success
-        
-        if not st.session_state.rag_enabled: 
+
+        if not st.session_state.rag_enabled:
             st.info("Mode RAG désactivé. Génération de réponse sans consultation des documents.")
         elif st.session_state.faiss_index is None or st.session_state.faiss_index.ntotal == 0 :
             st.warning("Base de données vectorielle FAISS vide ou non initialisée. Le mode RAG est actif mais aucun document n'est disponible pour la recherche.")
         else: # RAG enabled, FAISS available and has data
             with st.spinner("Étape 6: Vectorisation de la requête et recherche sémantique dans FAISS..."):
                 query_preprocessed = preprocess_text(user_query)
-                query_embedding = get_embedding(query_preprocessed, st.session_state.openai_api_key, model=st.session_state.embedding_model)
+                provider = st.session_state.get('provider', 'groq')
+                api_key_for_embedding = st.session_state.get('groq_api_key') if provider == 'groq' else None
+                query_embedding = get_embedding(query_preprocessed, api_key_for_embedding, model=st.session_state.get('groq_model'))
                 if query_embedding:
                     retrieved_chunks_for_llm = faiss_similarity_search(
                         query_embedding, st.session_state.faiss_index, st.session_state.chunk_store,
@@ -727,28 +968,32 @@ if st.button("Obtenir Réponse (OpenAI avec/sans RAG FAISS)"):
                                 st.markdown(f"**Langue (Doc):** `{lang_info}`")
                                 st.markdown(f"**Texte du Chunk:**\n\n{chunk_info['text']}")
                     else: st.info("Aucun chunk pertinent n'a été trouvé dans FAISS avec les critères actuels. La réponse sera générée sans contexte documentaire.")
-                else: 
+                else:
                     st.error("Échec de la vectorisation de la requête. La réponse sera générée sans contexte documentaire.")
                     query_embedding_success = False # Mark as failed
-        
-        with st.spinner("Étape 7: Génération de la réponse via le LLM OpenAI..."):
-            # Use gpt-4 or gpt-4o as per doc 2.1.1
-            llm_model_to_use = "gpt-4o" # Default to gpt-4o as per latest in doc
-            final_answer = real_llm_generation_with_openai(
-                user_query, 
-                retrieved_chunks_for_llm if query_embedding_success else [], # Pass empty if embedding failed
-                st.session_state.openai_api_key,
-                model=llm_model_to_use 
+
+        with st.spinner("Étape 7: Génération de la réponse via le LLM..."):
+            # Default LLM model placeholder. Groq models can be 'gpt-oss-20b', 'llama3-8b-8192', etc.
+            llm_model_to_use = st.session_state.get('groq_model', 'gpt-oss-20b')
+            if provider == 'groq':
+                # Use configured groq_model from sidebar/session (example default: gpt-oss-20b)
+                llm_model_to_use = st.session_state.get('groq_model', 'gpt-oss-20b')
+            api_key_for_llm = st.session_state.get('groq_api_key') if provider == 'groq' else None
+            final_answer = real_llm_generation(
+                user_query,
+                retrieved_chunks_for_llm if query_embedding_success else [],
+                api_key_for_llm,
+                model=llm_model_to_use
             )
-            
+
             answer_header = f"Réponse (Modèle LLM: {llm_model_to_use}"
-            if st.session_state.rag_enabled and query_embedding_success and retrieved_chunks_for_llm: 
+            if st.session_state.rag_enabled and query_embedding_success and retrieved_chunks_for_llm:
                 answer_header += " - avec contexte RAG/FAISS)"
-            elif st.session_state.rag_enabled: 
+            elif st.session_state.rag_enabled:
                 answer_header += " - RAG actif, mais sans contexte FAISS pertinent/disponible)"
-            else: 
+            else:
                 answer_header += " - RAG désactivé, LLM seul)"
-            
+
             st.subheader(answer_header)
             st.markdown(final_answer) # Étape 8: Affichage final
 st.markdown("---")
@@ -761,7 +1006,7 @@ st.sidebar.markdown(
     "- **Exploitation (Doc 3.1 `rag_pipeline`):** Génère des réponses augmentées si RAG est actif."
 )
 st.sidebar.metric("Nombre de Documents Traités", st.session_state.doc_counter)
-if faiss_available and st.session_state.faiss_index:
+if faiss_available and st.session_state.faiss_index is not None:
     st.sidebar.metric("Nombre de Chunks Indexés (FAISS)", st.session_state.faiss_index.ntotal)
     st.sidebar.metric("Nombre de Métadonnées de Chunks", len(st.session_state.chunk_store))
 else:
@@ -773,16 +1018,16 @@ st.sidebar.markdown("**Extensions Futures (Doc 3.5):**")
 st.sidebar.caption("- Intégration MongoDB (logs, supervision)")
 st.sidebar.caption("- Authentification utilisateur")
 # SharePoint/OneDrive (Doc 2.1.1) would also be a major future extension
-st.sidebar.caption("- Connecteurs SharePoint / OneDrive (Doc 2.1.1)") 
+st.sidebar.caption("- Connecteurs SharePoint / OneDrive (Doc 2.1.1)")
 st.sidebar.markdown("---")
 
 
 if st.sidebar.button("Effacer Toutes les Données et Réinitialiser l'Agent"):
     st.session_state.documents = {}
-    st.session_state.chunk_store = [] 
+    st.session_state.chunk_store = []
     st.session_state.doc_counter = 0
-    if faiss_available: 
-        st.session_state.faiss_index = None 
+    if faiss_available:
+        st.session_state.faiss_index = None
         st.session_state.faiss_index_dim = None
 
     # Reset input field keys to force re-render
@@ -790,7 +1035,7 @@ if st.sidebar.button("Effacer Toutes les Données et Réinitialiser l'Agent"):
     st.session_state.web_url_input_key_suffix += 1
     st.session_state.doc_name_manual_input_key_suffix += 1
     st.session_state.doc_text_area_input_key_suffix += 1
-    
+
     # Reset Guardrails to default
     st.session_state.guardrails_enabled = {
         "conli": False, "cove": False, "contextcheck": False,

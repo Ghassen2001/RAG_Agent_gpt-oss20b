@@ -1,16 +1,20 @@
 # requirements.txt
 
-streamlit
-openai
+streamlit  # / Gradio 
 pandas
-langdetect
+langdetect 
 # scikit-learn is no longer strictly needed by the core RAG logic if FAISS handles similarity
 # but might be useful for other tasks if you expand. Let's keep it for now.
 scikit-learn
 numpy
-PyPDF2
-beautifulsoup4
-Pillow
-easyocr
-requests
-faiss-cpu # or faiss-gpu if you have a compatible GPU and CUDA setup
+PyPDF2 # scrapping data from PDF docs
+beautifulsoup4 # scrapping from the web
+Pillow # enable reading images
+easyocr # extracting text data from images
+requests # to interact with URLS
+faiss-cpu # or faiss-gpu if you have a compatible GPU and CUDA setup / our vactor database
+sentence-transformers
+transformers
+torch
+python-docx  # for reading .docx files (imported as `docx`)
+groq  # GROQ SDK (optional; used as `from groq import Groq`)
